@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>N-Body Gravity (WebGPU)</title>
+<script src="three.min.js"></script>
+<style>
+  html,body{ height:100%; margin:0; background:#03040a; overflow:hidden; font-family:system-ui,sans-serif; }
+  #container{ width:100vw; height:100vh; }
+  canvas{ display:block; width:100%; height:100%; }
+  #hud{ position:fixed; top:12px; left:12px; color:#cfe0ff; font-size:13px; line-height:1.5;
+        background:rgba(6,10,20,0.55); padding:10px 14px; border-radius:8px; user-select:none; }
+  #hud b{ color:#fff; }
+  #presets{ margin-top:8px; display:flex; gap:6px; }
+  #presets button{ background:rgba(255,255,255,0.08); color:#cfe0ff; border:1px solid rgba(255,255,255,0.2);
+        border-radius:5px; padding:4px 10px; font-size:12px; cursor:pointer; }
+  #presets button.active{ background:#3a6acf; color:#fff; border-color:#5a8aef; }
+  #presets button:hover{ background:rgba(255,255,255,0.18); }
+  #fallback{ position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+        color:#dfe6f0; font-size:16px; text-align:center; padding:40px; box-sizing:border-box; }
+</style>
+</head>
+<body>
+<div id="container"></div>
+<div id="hud">
+  <div><b>N-Body Gravity</b> - real O(n&sup2;) pairwise gravity, computed on the GPU every frame</div>
+  <div>particles: <b id="hudCount">-</b> &nbsp; fps: <b id="hudFps">-</b></div>
+  <div id="presets"></div>
+  <div style="margin-top:6px; opacity:0.75;">drag to orbit - scroll to zoom</div>
+</div>
+<div id="fallback" style="display:none;"></div>
+<script>
+// A genuine N-body gravitational simulation, not an analytical shortcut like
+// the black-hole/whirlpool scenes next door - a WGSL compute shader computes
+// real pairwise Newtonian gravity between every particle and every other
+// particle (softened to avoid singularities at close range) and integrates
+// motion with semi-implicit Euler, entirely on the GPU. One massive central
+// body plus a disk of lighter bodies on near-circular initial orbits, left to
+// evolve under their own mutual gravity - any structure you see (density
+// waves, ejections, the disk warping) is the physics actually happening, not
+// scripted.
+//
+// This needs WebGPU specifically (not WebGL, which the rest of this project
+// uses) because WebGL has no general-purpose compute shaders - there'd be no
+// way to do real N-body physics at more than a token particle count without
+// it. Three.js is used here only as a math/camera-orbit helper (borrowed from
+// the whirlpool scene's controls) - all the actual GPU work is raw WebGPU.
+//
+// Quality is just "how many bodies" - the classic video-game low/medium/high
+// axis - because O(n^2) pairwise gravity means cost scales with the SQUARE of
+// particle count, so this is the one knob that matters most for whether a
+// given GPU can keep it smooth.
+
+const PRESETS = [
+    { name: 'Low', count: 1500 },
+    { name: 'Medium', count: 4000 },
+    { name: 'High', count: 8000 },
+    { name: 'Ultra', count: 16000 },
+    { name: 'Extreme', count: 28000 } // dedicated-GPU territory - integrated graphics will chug here
+];
+
+const PARTICLE_BYTES = 32; // vec4 pos (xyz + mass) + vec4 vel (xyz + pad)
+const WORKGROUP_SIZE = 64;
+const G = 0.6;
+const CENTRAL_COUNT = 3;
+const CENTRAL_MASS = 4200; // per-body - CENTRAL_COUNT * CENTRAL_MASS stays close to the old single-body total
+const CENTRAL_RING_R = 11;
+const SOFTENING2 = 0.6 * 0.6;
+const PHYSICS_DT = 0.01;
+const DISK_INNER_LOCAL = 2.0, DISK_OUTER_LOCAL = 6.5; // per mini-disk, in the orbiting body's own local frame
+
+let device, context, canvasFormat;
+let computePipeline, renderPipeline;
+let particleBuffers = [null, null];
+let bindGroupsCompute = [null, null]; // [0]: read A write B, [1]: read B write A
+let renderBindGroups = [null, null];
+let simParamsBuffer, renderUniformBuffer;
+let particleCount = 0;
+let pingPong = 0;
+let fpsLastT = performance.now(), fpsFrames = 0;
+
+// Camera (Three.js used purely as matrix/vector math here - no THREE renderer)
+const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 4000);
+const cameraTarget = new THREE.Vector3(0, 0, 0);
+let camAzimuth = 0.5, camPolar = 1.15, camRadius = 34;
+const CAM_R_MIN = 4, CAM_R_MAX = 140;
+const CAM_POLAR_MIN = 0.08, CAM_POLAR_MAX = Math.PI - 0.08;
+
+async function init() {
+    if (!navigator.gpu) {
+        showFallback('This browser does not expose WebGPU (navigator.gpu is undefined). ' +
+            'Try a recent Chrome or Edge on desktop.');
+        return;
+    }
+
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+        showFallback('WebGPU is present but no compatible GPU adapter was found.');
+        return;
+    }
+    device = await adapter.requestDevice();
+    device.lost.then(info => showFallback('WebGPU device was lost: ' + info.message));
+
+    const canvas = document.createElement('canvas');
+    document.getElementById('container').appendChild(canvas);
+    context = canvas.getContext('webgpu');
+    canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+    context.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
+
+    computePipeline = buildComputePipeline();
+    renderPipeline = buildRenderPipeline();
+
+    simParamsBuffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    renderUniformBuffer = device.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+    buildPresetButtons();
+    setupCameraControls(canvas);
+    window.addEventListener('resize', () => resizeCanvas(canvas));
+    resizeCanvas(canvas);
+
+    setPreset(0);
+    requestAnimationFrame(t => loop(t, canvas));
+}
+
+function showFallback(message) {
+    document.getElementById('hud').style.display = 'none';
+    const el = document.getElementById('fallback');
+    el.style.display = 'flex';
+    el.textContent = message;
+}
+
+function resizeCanvas(canvas) {
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.75);
+    canvas.width = Math.floor(window.innerWidth * dpr);
+    canvas.height = Math.floor(window.innerHeight * dpr);
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+}
+
+// ============================== WGSL: COMPUTE (real N-body gravity) ==============================
+
+function buildComputePipeline() {
+    const module = device.createShaderModule({ code: `
+        struct Particle {
+            pos: vec4<f32>, // xyz = position, w = mass
+            vel: vec4<f32>, // xyz = velocity, w unused
+        };
+        struct SimParams {
+            dt: f32,
+            count: u32,
+            gravity: f32,
+            softening2: f32,
+        };
+
+        @group(0) @binding(0) var<storage, read> particlesIn: array<Particle>;
+        @group(0) @binding(1) var<storage, read_write> particlesOut: array<Particle>;
+        @group(0) @binding(2) var<uniform> params: SimParams;
+
+        @compute @workgroup_size(${WORKGROUP_SIZE})
+        fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+            let i = gid.x;
+            if (i >= params.count) { return; }
+
+            let me = particlesIn[i];
+            var pos = me.pos.xyz;
+            var vel = me.vel.xyz;
+            let mass = me.pos.w;
+
+            var accel = vec3<f32>(0.0, 0.0, 0.0);
+            var j: u32 = 0u;
+            loop {
+                if (j >= params.count) { break; }
+                if (j != i) {
+                    let other = particlesIn[j];
+                    let diff = other.pos.xyz - pos;
+                    let distSq = dot(diff, diff) + params.softening2;
+                    let invDist = inverseSqrt(distSq);
+                    let invDist3 = invDist * invDist * invDist;
+                    accel = accel + diff * (params.gravity * other.pos.w * invDist3);
+                }
+                j = j + 1u;
+            }
+
+            // Semi-implicit (symplectic) Euler: velocity updates from the
+            // current acceleration, then position updates from the NEW
+            // velocity - notably more stable for orbital motion than naive
+            // explicit Euler at the same step size.
+            vel = vel + accel * params.dt;
+            pos = pos + vel * params.dt;
+
+            particlesOut[i] = Particle(vec4<f32>(pos, mass), vec4<f32>(vel, 0.0));
+        }
+    ` });
+
+    return device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+}
+
+// ============================== WGSL: RENDER (instanced billboards) ==============================
+
+function buildRenderPipeline() {
+    const module = device.createShaderModule({ code: `
+        struct Particle {
+            pos: vec4<f32>,
+            vel: vec4<f32>,
+        };
+        struct Uniforms {
+            viewProj: mat4x4<f32>,
+            camRight: vec4<f32>,
+            camUp: vec4<f32>,
+        };
+
+        @group(0) @binding(0) var<storage, read> particles: array<Particle>;
+        @group(0) @binding(1) var<uniform> uniforms: Uniforms;
+
+        struct VertexOut {
+            @builtin(position) clipPos: vec4<f32>,
+            @location(0) uv: vec2<f32>,
+            @location(1) color: vec3<f32>,
+        };
+
+        @vertex
+        fn vs_main(@builtin(vertex_index) vIdx: u32, @builtin(instance_index) iIdx: u32) -> VertexOut {
+            var corners = array<vec2<f32>, 6>(
+                vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0),
+                vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0)
+            );
+            let corner = corners[vIdx];
+            let p = particles[iIdx];
+            let speed = length(p.vel.xyz);
+
+            let size = clamp(sqrt(p.pos.w) * 0.045, 0.03, 3.2);
+            let worldPos = p.pos.xyz + uniforms.camRight.xyz * corner.x * size + uniforms.camUp.xyz * corner.y * size;
+
+            var out: VertexOut;
+            out.clipPos = uniforms.viewProj * vec4<f32>(worldPos, 1.0);
+            out.uv = corner * 0.5 + vec2<f32>(0.5, 0.5);
+
+            let t = clamp(speed * 0.05, 0.0, 1.0);
+            let slow = vec3<f32>(0.4, 0.55, 0.95);
+            let fast = vec3<f32>(1.0, 0.82, 0.5);
+            out.color = mix(slow, fast, t);
+            return out;
+        }
+
+        @fragment
+        fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+            let d = length(in.uv - vec2<f32>(0.5, 0.5));
+            if (d > 0.5) { discard; }
+            let alpha = smoothstep(0.5, 0.05, d) * 0.75;
+            return vec4<f32>(in.color, alpha);
+        }
+    ` });
+
+    return device.createRenderPipeline({
+        layout: 'auto',
+        vertex: { module, entryPoint: 'vs_main' },
+        fragment: {
+            module, entryPoint: 'fs_main',
+            targets: [{
+                format: canvasFormat,
+                blend: {
+                    color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                    alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' }
+                }
+            }]
+        },
+        primitive: { topology: 'triangle-list' }
+    });
+}
+
+// ============================== SIMULATION SETUP ==============================
+
+function seedParticles(count) {
+    const data = new Float32Array(count * 8);
+
+    // CENTRAL_COUNT massive bodies on a ring, given velocities for roughly
+    // circular motion around their mutual center of mass. This is NOT an
+    // exactly stable configuration for more than two bodies (symmetric
+    // N-body rings generally aren't, even tuned perfectly - "Klemperer
+    // rosettes" are a famous example of a rosette that balances but is still
+    // an unstable equilibrium) - real drift and slow chaos over minutes of
+    // watching is expected and is the point, not a bug.
+    const centrals = [];
+    for (let k = 0; k < CENTRAL_COUNT; k++) {
+        const angle = (k / CENTRAL_COUNT) * Math.PI * 2 + (Math.random() - 0.5) * 0.15;
+        const r = CENTRAL_RING_R * (0.92 + Math.random() * 0.16);
+        const x = Math.cos(angle) * r, z = Math.sin(angle) * r;
+        const vCirc = Math.sqrt((G * (CENTRAL_COUNT - 1) * CENTRAL_MASS) / r) * (0.9 + Math.random() * 0.2);
+        const vx = -Math.sin(angle) * vCirc, vz = Math.cos(angle) * vCirc;
+
+        centrals.push({ x, z, vx, vz });
+        const idx = k * 8;
+        data[idx] = x; data[idx + 1] = 0; data[idx + 2] = z; data[idx + 3] = CENTRAL_MASS;
+        data[idx + 4] = vx; data[idx + 5] = 0; data[idx + 6] = vz; data[idx + 7] = 0;
+    }
+
+    // Every other particle gets a mini-disk of its own around one of the
+    // central bodies (evenly distributed), on a near-circular orbit relative
+    // to that body specifically - its position/velocity are added on top of
+    // its parent's, so the whole mini-disk rides along as its central body
+    // moves. As the centrals perturb each other, expect mini-disks to warp,
+    // exchange material, or get tidally stripped - real N-body behavior.
+    for (let i = CENTRAL_COUNT; i < count; i++) {
+        const parent = centrals[i % CENTRAL_COUNT];
+        const r = DISK_INNER_LOCAL + Math.pow(Math.random(), 0.7) * (DISK_OUTER_LOCAL - DISK_INNER_LOCAL);
+        const angle = Math.random() * Math.PI * 2;
+        const height = (Math.random() - 0.5) * 0.7 * (r / DISK_OUTER_LOCAL);
+        const mass = 0.6 + Math.random() * 1.8;
+
+        const localX = Math.cos(angle) * r, localZ = Math.sin(angle) * r;
+        const vCirc = Math.sqrt((G * CENTRAL_MASS) / r) * (0.92 + Math.random() * 0.16);
+        const localVx = -Math.sin(angle) * vCirc, localVz = Math.cos(angle) * vCirc;
+
+        const idx = i * 8;
+        data[idx] = parent.x + localX; data[idx + 1] = height; data[idx + 2] = parent.z + localZ; data[idx + 3] = mass;
+        data[idx + 4] = parent.vx + localVx; data[idx + 5] = (Math.random() - 0.5) * 0.35;
+        data[idx + 6] = parent.vz + localVz; data[idx + 7] = 0;
+    }
+    return data;
+}
+
+function setPreset(index) {
+    const preset = PRESETS[index];
+    particleCount = preset.count;
+    document.getElementById('hudCount').textContent = particleCount.toLocaleString();
+    document.querySelectorAll('#presets button').forEach((b, i) => b.classList.toggle('active', i === index));
+
+    const initialData = seedParticles(particleCount);
+    const byteSize = particleCount * PARTICLE_BYTES;
+
+    particleBuffers.forEach(buf => { if (buf) buf.destroy(); });
+    particleBuffers[0] = device.createBuffer({
+        size: byteSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, mappedAtCreation: true
+    });
+    new Float32Array(particleBuffers[0].getMappedRange()).set(initialData);
+    particleBuffers[0].unmap();
+    particleBuffers[1] = device.createBuffer({ size: byteSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+
+    bindGroupsCompute[0] = device.createBindGroup({
+        layout: computePipeline.getBindGroupLayout(0),
+        entries: [
+            { binding: 0, resource: { buffer: particleBuffers[0] } },
+            { binding: 1, resource: { buffer: particleBuffers[1] } },
+            { binding: 2, resource: { buffer: simParamsBuffer } }
+        ]
+    });
+    bindGroupsCompute[1] = device.createBindGroup({
+        layout: computePipeline.getBindGroupLayout(0),
+        entries: [
+            { binding: 0, resource: { buffer: particleBuffers[1] } },
+            { binding: 1, resource: { buffer: particleBuffers[0] } },
+            { binding: 2, resource: { buffer: simParamsBuffer } }
+        ]
+    });
+    renderBindGroups[0] = device.createBindGroup({
+        layout: renderPipeline.getBindGroupLayout(0),
+        entries: [
+            { binding: 0, resource: { buffer: particleBuffers[0] } },
+            { binding: 1, resource: { buffer: renderUniformBuffer } }
+        ]
+    });
+    renderBindGroups[1] = device.createBindGroup({
+        layout: renderPipeline.getBindGroupLayout(0),
+        entries: [
+            { binding: 0, resource: { buffer: particleBuffers[1] } },
+            { binding: 1, resource: { buffer: renderUniformBuffer } }
+        ]
+    });
+
+    pingPong = 0;
+    device.queue.writeBuffer(simParamsBuffer, 0, new Float32Array([PHYSICS_DT, 0, G, SOFTENING2]));
+    device.queue.writeBuffer(simParamsBuffer, 4, new Uint32Array([particleCount]));
+}
+
+function buildPresetButtons() {
+    const container = document.getElementById('presets');
+    PRESETS.forEach((preset, i) => {
+        const btn = document.createElement('button');
+        btn.textContent = preset.name;
+        btn.addEventListener('click', () => setPreset(i));
+        container.appendChild(btn);
+    });
+}
+
+// ============================== CAMERA CONTROLS (drag to orbit, wheel to zoom) ==============================
+
+function setupCameraControls(canvas) {
+    canvas.style.cursor = 'grab';
+    canvas.style.touchAction = 'none';
+    let dragging = false, lastX = 0, lastY = 0;
+
+    canvas.addEventListener('pointerdown', e => {
+        dragging = true; lastX = e.clientX; lastY = e.clientY;
+        canvas.setPointerCapture(e.pointerId);
+        canvas.style.cursor = 'grabbing';
+    });
+    canvas.addEventListener('pointerup', e => {
+        dragging = false; canvas.style.cursor = 'grab';
+        canvas.releasePointerCapture(e.pointerId);
+    });
+    canvas.addEventListener('pointercancel', () => { dragging = false; canvas.style.cursor = 'grab'; });
+    canvas.addEventListener('pointermove', e => {
+        if (!dragging) return;
+        const dx = e.clientX - lastX, dy = e.clientY - lastY;
+        lastX = e.clientX; lastY = e.clientY;
+        camAzimuth -= dx * 0.006;
+        camPolar = THREE.MathUtils.clamp(camPolar - dy * 0.006, CAM_POLAR_MIN, CAM_POLAR_MAX);
+    });
+    canvas.addEventListener('wheel', e => {
+        e.preventDefault();
+        camRadius = THREE.MathUtils.clamp(camRadius + e.deltaY * 0.04, CAM_R_MIN, CAM_R_MAX);
+    }, { passive: false });
+}
+
+function updateCamera() {
+    const sinPolar = Math.sin(camPolar);
+    camera.position.set(
+        camRadius * sinPolar * Math.sin(camAzimuth),
+        camRadius * Math.cos(camPolar),
+        camRadius * sinPolar * Math.cos(camAzimuth)
+    );
+    camera.lookAt(cameraTarget);
+    camera.updateMatrixWorld();
+}
+
+// ============================== ANIMATE ==============================
+
+function loop(nowMs, canvas) {
+    requestAnimationFrame(t => loop(t, canvas));
+
+    updateCamera();
+    const viewProj = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    const worldMatrix = camera.matrixWorld.elements; // column-major: [rightX,rightY,rightZ,0, upX,upY,upZ,0, ...]
+
+    const uniformData = new Float32Array(24);
+    uniformData.set(viewProj.elements, 0); // 16 floats
+    uniformData[16] = worldMatrix[0]; uniformData[17] = worldMatrix[1]; uniformData[18] = worldMatrix[2]; uniformData[19] = 0;
+    uniformData[20] = worldMatrix[4]; uniformData[21] = worldMatrix[5]; uniformData[22] = worldMatrix[6]; uniformData[23] = 0;
+    device.queue.writeBuffer(renderUniformBuffer, 0, uniformData);
+
+    const encoder = device.createCommandEncoder();
+
+    const computePass = encoder.beginComputePass();
+    computePass.setPipeline(computePipeline);
+    computePass.setBindGroup(0, bindGroupsCompute[pingPong]);
+    computePass.dispatchWorkgroups(Math.ceil(particleCount / WORKGROUP_SIZE));
+    computePass.end();
+    pingPong = 1 - pingPong;
+
+    const renderPass = encoder.beginRenderPass({
+        colorAttachments: [{
+            view: context.getCurrentTexture().createView(),
+            clearValue: { r: 0.01, g: 0.015, b: 0.03, a: 1 },
+            loadOp: 'clear',
+            storeOp: 'store'
+        }]
+    });
+    renderPass.setPipeline(renderPipeline);
+    renderPass.setBindGroup(0, renderBindGroups[pingPong]);
+    renderPass.draw(6, particleCount);
+    renderPass.end();
+
+    device.queue.submit([encoder.finish()]);
+
+    fpsFrames++;
+    if (nowMs - fpsLastT > 500) {
+        const fps = Math.round((fpsFrames * 1000) / (nowMs - fpsLastT));
+        document.getElementById('hudFps').textContent = fps;
+        fpsFrames = 0;
+        fpsLastT = nowMs;
+    }
+}
+
+init();
+</script>
+</body>
+</html>
